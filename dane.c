@@ -327,5 +327,27 @@ check_cert(struct dane_rr *dane_rr, X509 *cert)
 		if (dane_rr->data[i] != mdp[i])
 			ret = 0;
 
+	if (ret == 0) {
+		printf("+ mismatch...\n");
+		printf("\texpected:\t");
+		if (dane_rr->matching == MATCH_CAD) {
+			printf("%s", dane_rr->data);
+		}
+		else {
+			for (i = 0; i < md_len; ++i)
+				printf("%02x", dane_rr->data[i]);
+		}
+		printf("\n");
+		printf("\tcomputed:\t");
+		if (dane_rr->matching == MATCH_CAD) {
+			printf("%s", mdp);
+		}
+		else {
+			for (i = 0; i < md_len; ++i)
+				printf("%02x", mdp[i]);
+		}
+		printf("\n");
+	}
+
 	return ret;
 }

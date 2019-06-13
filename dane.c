@@ -28,8 +28,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 
 #include "dane.h"
@@ -37,9 +39,47 @@
 extern char *__progname;
 
 X509 *crt = NULL;
+int check_cert(struct dane_rr *dane_rr, X509 *cert);
+X509 *get_x509(const char *hostname, int port);
 
-int
-check_cert(struct dane_rr *dane_rr, X509 *cert);
+X509 *
+get_x509(const char *hostname, int port)
+{
+	int sd;
+	struct hostent *host;
+	struct sockaddr_in addr;
+	const SSL_METHOD *method = NULL;
+	SSL_CTX *ctx = NULL;
+	SSL *ssl = NULL;
+
+	if ((host = gethostbyname(hostname)) == NULL)
+		err(1, "gethostbyname");
+
+	sd = socket(PF_INET, SOCK_STREAM, 0);
+	memset(&addr, 0, sizeof addr);
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = *(long *)(host->h_addr);
+	if (connect(sd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+		err(1, "connect");
+
+	OpenSSL_add_all_algorithms();
+	SSL_load_error_strings();
+	method = TLSv1_2_client_method();
+	ctx = SSL_CTX_new(method);
+	if (ctx == NULL)
+		errx(1, "SSL_CTX_new");
+
+	ssl = SSL_new(ctx);
+	if (ssl == NULL)
+		errx(1, "SSL_new");
+
+	SSL_set_fd(ssl, sd);
+	if (SSL_connect(ssl) != 1)
+		errx(1, "SSL_connect");
+
+	return SSL_get_peer_certificate(ssl);
+}
 
 int
 main(int argc, char *argv[])
@@ -47,22 +87,16 @@ main(int argc, char *argv[])
 	struct dane_session *dane;
 	const char *domain;
 	const char *port;
-	BIO *crt_bio;
 	char record[255];
 
-	if (argc < 3)
-		errx(1, "usage: %s domain port [cert.pem]", __progname);
-
-	if (argc == 4) {
-		crt_bio = BIO_new(BIO_s_file());
-		BIO_read_filename(crt_bio, argv[3]);
-		if ((crt = PEM_read_bio_X509(crt_bio, NULL, NULL, NULL)) == NULL)
-			errx(1, "could not load certificate");
-	}
+	if (argc != 3)
+		errx(1, "usage: %s domain port", __progname);
 
 	domain = argv[1];
 	port = argv[2];
 
+	crt = get_x509(domain, atoi(port));
+	
   	event_init();
 
 	dane = dane_session(42);
@@ -76,7 +110,6 @@ main(int argc, char *argv[])
 	dane_free(dane);
 	return 0;
 }
-
 
 struct dane_session *
 dane_session(uint64_t reqid)
@@ -225,12 +258,10 @@ dns_rr_tlsa(struct dane_session *dane, struct dns_rr *rr)
 
 	printf("+ record resolved to TLSA: %s, %s, %s, %s\n", usage, selector, matching, buffer);
 
-	if (crt) {
-		if (check_cert(&dane_rr, crt))
-			printf("+ cert check success\n");
-		else
-			printf("+ cert check failure\n");
-	}
+	if (check_cert(&dane_rr, crt))
+		printf("+ cert check success\n");
+	else
+		printf("+ cert check failure\n");
 
 	return;
 
@@ -245,8 +276,9 @@ check_cert(struct dane_rr *dane_rr, X509 *cert)
 	EVP_MD_CTX	*md_ctx = NULL;
 	unsigned char	*out = NULL;
 	unsigned char	 md_value[EVP_MAX_MD_SIZE];
+	const unsigned char	*mdp = NULL;
 	int		 outlen;
-	int		 md_len;
+	int		 md_len = 0;
 	int		 i;
 	int		 ret = 0;
 
@@ -265,10 +297,8 @@ check_cert(struct dane_rr *dane_rr, X509 *cert)
 		if ((size_t)outlen != dane_rr->dlen)
 			break;
 
-		ret = 1;
-		for (i = 0; i < outlen; ++i)
-			if (out[i] != dane_rr->data[i])
-				ret = 0;
+		mdp = out;
+		md_len = outlen;
 		break;
 
 	case MATCH_SHA256:
@@ -278,10 +308,7 @@ check_cert(struct dane_rr *dane_rr, X509 *cert)
 		EVP_DigestFinal_ex(md_ctx, md_value, &md_len);
 		EVP_MD_CTX_free(md_ctx);
 
-		ret = 1;
-		for (i = 0; i < md_len; ++i)
-			if (md_value[i] != dane_rr->data[i])
-				ret = 0;
+		mdp = md_value;
 		break;
 
 	case MATCH_SHA512:
@@ -291,13 +318,14 @@ check_cert(struct dane_rr *dane_rr, X509 *cert)
 		EVP_DigestFinal_ex(md_ctx, md_value, &md_len);
 		EVP_MD_CTX_free(md_ctx);
 
-		ret = 1;
-		for (i = 0; i < md_len; ++i)
-			if (md_value[i] != dane_rr->data[i])
-				ret = 0;
+		mdp = md_value;
 		break;
 	}
-	
+
+	ret = 1;
+	for (i = 0; i < md_len; ++i)
+		if (dane_rr->data[i] != mdp[i])
+			ret = 0;
 
 	return ret;
 }

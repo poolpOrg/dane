@@ -28,19 +28,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+
 #include "dane.h"
+
+extern char *__progname;
+
+X509 *crt = NULL;
+
+int
+check_cert(struct dane_rr *dane_rr, X509 *cert);
 
 int
 main(int argc, char *argv[])
 {
-	const char *domain  = argv[1];
-	const char *port  = argv[2];
 	struct dane_session *dane;
-	extern char	*__progname;
+	const char *domain;
+	const char *port;
+	BIO *crt_bio;
 	char record[255];
 
 	if (argc < 3)
-		errx(1, "usage: %s domain port", __progname);
+		errx(1, "usage: %s domain port [cert.pem]", __progname);
+
+	if (argc == 4) {
+		crt_bio = BIO_new(BIO_s_file());
+		BIO_read_filename(crt_bio, argv[3]);
+		if ((crt = PEM_read_bio_X509(crt_bio, NULL, NULL, NULL)) == NULL)
+			errx(1, "could not load certificate");
+	}
+
+	domain = argv[1];
+	port = argv[2];
 
   	event_init();
 
@@ -203,7 +224,80 @@ dns_rr_tlsa(struct dane_session *dane, struct dns_rr *rr)
 	}
 
 	printf("+ record resolved to TLSA: %s, %s, %s, %s\n", usage, selector, matching, buffer);
+
+	if (crt) {
+		if (check_cert(&dane_rr, crt))
+			printf("+ cert check success\n");
+		else
+			printf("+ cert check failure\n");
+	}
+
 	return;
+
 bogus:
 	printf("+ invalid TLSA record\n");
+}
+
+int
+check_cert(struct dane_rr *dane_rr, X509 *cert)
+{
+	EVP_PKEY	*pkey;
+	EVP_MD_CTX	*md_ctx = NULL;
+	unsigned char	*out = NULL;
+	unsigned char	 md_value[EVP_MAX_MD_SIZE];
+	int		 outlen;
+	int		 md_len;
+	int		 i;
+	int		 ret = 0;
+
+	switch (dane_rr->selector) {
+	case ENTIRE_CERTIFICATE:
+		outlen = i2d_X509(cert, &out);
+		break;
+	case PUBLIC_KEY:
+		pkey = X509_get_pubkey(cert);
+		outlen = i2d_PUBKEY(pkey, &out);
+		break;
+	}
+
+	switch (dane_rr->matching) {
+	case MATCH_CAD:
+		if ((size_t)outlen != dane_rr->dlen)
+			break;
+
+		ret = 1;
+		for (i = 0; i < outlen; ++i)
+			if (out[i] != dane_rr->data[i])
+				ret = 0;
+		break;
+
+	case MATCH_SHA256:
+		md_ctx = EVP_MD_CTX_new();
+		EVP_DigestInit_ex(md_ctx, EVP_sha256(), NULL);
+		EVP_DigestUpdate(md_ctx, out, outlen);
+		EVP_DigestFinal_ex(md_ctx, md_value, &md_len);
+		EVP_MD_CTX_free(md_ctx);
+
+		ret = 1;
+		for (i = 0; i < md_len; ++i)
+			if (md_value[i] != dane_rr->data[i])
+				ret = 0;
+		break;
+
+	case MATCH_SHA512:
+		md_ctx = EVP_MD_CTX_new();
+		EVP_DigestInit_ex(md_ctx, EVP_sha512(), NULL);
+		EVP_DigestUpdate(md_ctx, out, outlen);
+		EVP_DigestFinal_ex(md_ctx, md_value, &md_len);
+		EVP_MD_CTX_free(md_ctx);
+
+		ret = 1;
+		for (i = 0; i < md_len; ++i)
+			if (md_value[i] != dane_rr->data[i])
+				ret = 0;
+		break;
+	}
+	
+
+	return ret;
 }

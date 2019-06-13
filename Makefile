@@ -19,6 +19,6 @@ YFLAGS=
 SRCS=	dane.c
 SRCS+=	unpack_dns.c
 
-LDADD+=	-levent
-DPADD+=	${LIBEVENT}
+LDADD+=	-levent -lssl -lcrypto
+DPADD+=	${LIBEVENT} ${LIBSSL} ${LIBCRYPTO}
 .include <bsd.prog.mk>
